@@ -1,4 +1,4 @@
-CFLAGS+=	-std=gnu99 -Wall -g
+CFLAGS+=	-std=gnu99 -Wall -g -O0
 LDFLAGS+=	-lpthread
 
 all: db

@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -19,8 +20,9 @@ struct indata {
 
 struct idmap {
 	uint32_t	following;
-	uint32_t	follower;
-	uint32_t	nfollower;
+	uint32_t	followed;
+	uint32_t	nfollowing;
+	uint32_t	nfollowed;
 };
 
 struct perthread {
@@ -45,6 +47,12 @@ uint32_t *following;
 uint32_t *followed;
 
 struct idmap *idmap;
+
+static int
+cmpid(const void *a, const void *b)
+{
+	return (*(uint32_t *)a - *(uint32_t *)b);
+}
 
 static void *
 worker(void *arg)
@@ -86,6 +94,9 @@ worker(void *arg)
 	}
 	start = i;
 
+	if (mycpu == 0)
+		start = 0;
+
 	start2 = dest = start;
 	startid = indata[start].follower;
 	id = 0;
@@ -96,6 +107,7 @@ worker(void *arg)
 			idmap[id].following = dest;
 		}
 		following[dest++] = indata[i].leader;
+		idmap[id].nfollowing++;
 	}
 	end2 = dest;
 	endid = id;
@@ -111,8 +123,20 @@ worker(void *arg)
 	for (i = start2; i < end2; ++i) {
 		id = following[i];
 
-		__sync_add_and_fetch(&idmap[id].nfollower, 1);
+		__sync_add_and_fetch(&idmap[id].nfollowed, 1);
 	}
+
+	switch (pthread_barrier_wait(&bar)) {
+	case 0:
+	case PTHREAD_BARRIER_SERIAL_THREAD:
+		break;
+	default:
+		errx(1, "pthread_barrier_wait");
+	}
+
+	nleader = 0;
+	for (i = startid; i < endid; ++i)
+		nleader += idmap[i].nfollowed;
 
 	/* propagate counts */
 	if (mycpu != 0) {
@@ -122,9 +146,6 @@ worker(void *arg)
 			pthread_cond_wait(&me->cond, &me->mtx);
 		pthread_mutex_unlock(&me->mtx);
 	}
-
-	for (i = startid; i < endid; ++i)
-		nleader += idmap[i].nfollower;
 
 	start3 = me->nleader;
 	end3 = start3 + nleader;
@@ -140,8 +161,8 @@ worker(void *arg)
 
 	dest = start3;
 	for (i = startid; i < endid; ++i) {
-		idmap[i].follower = dest;
-		dest += idmap[i].nfollower;
+		idmap[i].followed = dest;
+		dest += idmap[i].nfollowed;
 	}
 
 	switch (pthread_barrier_wait(&bar)) {
@@ -152,31 +173,103 @@ worker(void *arg)
 		errx(1, "pthread_barrier_wait");
 	}
 
-	int nextfrom = 0;
+	for (from = startid; from < endid; ++from) {
+		int fromstart = idmap[from].following;
 
-	for (from = startid; from < endid; from = nextfrom) {
-		int endi = end2;
+		for (i = 0; i < idmap[from].nfollowing; ++i) {
+			int pos;
 
-		for (nextfrom = from + 1; nextfrom < endid; ++nextfrom) {
-			if (idmap[nextfrom].following != 0) {
-				endi = idmap[nextfrom].following;
-				break;
-			}
-		}
-
-		if (idmap[from].following == 0)
-			continue;
-
-		for (i = idmap[from].following; i < endi; ++i) {
-			id = following[i];
-			dest = __sync_add_and_fetch(&idmap[id].nfollower, -1);
-			followed[idmap[id].follower + dest] = from;
+			id = following[i + fromstart];
+			dest = idmap[id].followed;
+			pos = __sync_fetch_and_add(&followed[dest + idmap[id].nfollowed - 1], 1);
+			followed[dest + pos] = from;
 		}
 	}
 
+	switch (pthread_barrier_wait(&bar)) {
+	case 0:
+	case PTHREAD_BARRIER_SERIAL_THREAD:
+		break;
+	default:
+		errx(1, "pthread_barrier_wait");
+	}
+
+	for (i = startid; i < endid; ++i) {
+		qsort(&followed[idmap[i].followed], idmap[i].nfollowed,
+		      sizeof(*followed), cmpid);
+	}
+
+	switch (pthread_barrier_wait(&bar)) {
+	case 0:
+	case PTHREAD_BARRIER_SERIAL_THREAD:
+		break;
+	default:
+		errx(1, "pthread_barrier_wait");
+	}
+
 	/*
-	 * Now find pairs!
+	 * Now find pairs.
+	 *
+	 * Each of our id entries is a candidate x.
+	 * Each x might follow some leader a.
+	 * x must be in the list of followers of a, L(a).
+	 * We select a pair (x,y) for each y in L(a) where
+	 * y > x.  Then calculate the similarity of (x,y).
+	 *
+	 * We need to avoid to output the same pair multiple times.
+	 * To do so, we collect all y first for all L(a) and then sort
+	 * this list.  Skip duplicated items.
 	 */
+
+	size_t lbs = 1000, lbp;
+	uint32_t *lb = calloc(sizeof(*lb), lbs);
+
+	if (!lb)
+		err(1, "alloc");
+
+	for (uint32_t x = startid; x < endid; ++x) {
+		int nf = idmap[x].nfollowing;
+		int y;
+
+		lbp = 0;
+
+		dest = idmap[x].following;
+		for (i = 0; i < nf; ++i) {
+			uint32_t *pme;
+			int a;
+
+			a = following[dest + i];
+
+			/* Binary search for us */
+			pme = (uint32_t *)bsearch(&x, &followed[idmap[a].followed],
+				    idmap[a].nfollowed, sizeof(*followed),
+				    cmpid);
+
+			if (pme - &followed[idmap[a].followed] + 1 >= idmap[a].nfollowed)
+				continue;
+
+			if (lbp == lbs) {
+				lbs *= 2;
+				lb = realloc(lb, sizeof(*lb) * lbs);
+				if (!lb)
+					err(2, "alloc");
+			}
+
+			lb[lbp++] = pme[1];
+		}
+
+		qsort(lb, lbp, sizeof(*lb), cmpid);
+
+		y = 0;
+		for (i = 0; i < lbp; ++i) {
+			if (lb[i] == y)
+				continue;
+
+			y = lb[i];
+
+			/* calculate similarity between x and y */
+		}
+	}
 
 	return (NULL);
 }
@@ -214,8 +307,6 @@ int main (int argc, char const* argv[])
 	ncpu = sysconf(_SC_NPROCESSORS_ONLN);
 	if (ncpu == -1)
 		ncpu = 1;
-
-	ncpu *= 10;
 
 	threads = calloc(sizeof(*threads), ncpu);
 	if (!threads)
