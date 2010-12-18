@@ -108,38 +108,6 @@ worker(void *arg)
 		errx(1, "pthread_barrier_wait");
 	}
 
-#ifdef FULLRANGE
-	nleader = 0;
-	for (i = 0; i < nentries2; ++i) {
-		id = following[i];
-		if (is_crossptr(id) || id < start2 || id >= end2)
-			continue;
-
-		/* hack: first count the number of entries */
-		following[id]++;
-		nleader++;
-	}
-
-	/* propagate counts */
-	if (mycpu != 0) {
-		if ((errno = pthread_mutex_lock(&me->mtx)) != 0)
-			err(1, "pthread_mutex_lock");
-		while (!me->have_nleader)
-			pthread_cond_wait(&me->cond, &me->mtx);
-		pthread_mutex_unlock(&me->mtx);
-	}
-	start3 = me->nleader;
-	end3 = start3 + nleader;
-	if (mycpu != ncpu - 1) {
-		struct perthread *next = &threads[mycpu + 1];
-
-		pthread_mutex_lock(&next->mtx);
-		next->nleader = end3;
-		next->have_nleader = 1;
-		pthread_mutex_unlock(&next->mtx);
-		pthread_cond_signal(&next->cond);
-	}
-#else
 	for (i = start2; i < end2; ++i) {
 		id = following[i];
 
@@ -169,7 +137,6 @@ worker(void *arg)
 		pthread_mutex_unlock(&next->mtx);
 		pthread_cond_signal(&next->cond);
 	}
-#endif
 
 	dest = start3;
 	for (i = startid; i < endid; ++i) {
@@ -185,21 +152,6 @@ worker(void *arg)
 		errx(1, "pthread_barrier_wait");
 	}
 
-#ifdef FULLRANGE
-	for (i = 0; i < nentries2; ++i) {
-		id = following[i];
-		if (is_crossptr(id)) {
-			from = i;
-			continue;
-		}
-		if (id < start2 || id >= end2)
-			continue;
-
-		dest = get_crossptr(following[id]);
-		followed[dest]++;
-		followed[dest + followed[dest]] = from;
-	}
-#else
 	int nextfrom = 0;
 
 	for (from = startid; from < endid; from = nextfrom) {
@@ -221,7 +173,10 @@ worker(void *arg)
 			followed[idmap[id].follower + dest] = from;
 		}
 	}
-#endif
+
+	/*
+	 * Now find pairs!
+	 */
 
 	return (NULL);
 }
