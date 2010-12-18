@@ -17,6 +17,12 @@ struct indata {
 	uint32_t	leader;
 } __attribute__((__packed__));
 
+struct idmap {
+	uint32_t	following;
+	uint32_t	follower;
+	uint32_t	nfollower;
+};
+
 struct perthread {
 	pthread_t	id;
 	int		have_nleader;
@@ -38,25 +44,7 @@ struct indata *indata;
 uint32_t *following;
 uint32_t *followed;
 
-uint32_t *idmap;
-
-static int
-is_crossptr(uint32_t id)
-{
-	return (id & 0x80000000);
-}
-
-static int
-make_crossptr(uint32_t id)
-{
-	return (id | 0x80000000);
-}
-
-static int
-get_crossptr(uint32_t id)
-{
-	return (id & ~0x80000000);
-}
+struct idmap *idmap;
 
 static void *
 worker(void *arg)
@@ -66,9 +54,10 @@ worker(void *arg)
 	int start, end;
 	int start2, end2;
 	int start3, end3;
+	int startid, endid;
 	int nleader;
 	int i, dest, from;
-	uint32_t id, lastid;
+	uint32_t id;
 
 	start = nentries / ncpu * mycpu;
 	end = nentries / ncpu * (mycpu + 1);
@@ -97,43 +86,23 @@ worker(void *arg)
 	}
 	start = i;
 
-	start2 = dest = start + indata[i].follower - 1;	/* index is 1-based */
-	id = lastid = indata[i].follower - 1;
+	start2 = dest = start;
+	startid = indata[start].follower;
+	id = 0;
 	for (i = start; i < end; ++i) {
 		if (indata[i].follower != id) {
 			id = indata[i].follower;
 
-			/* put in temp counter for followed */
-			while (lastid++ != id) {
-				idmap[lastid] = dest;
-				following[dest++] = 0;
-			}
+			idmap[id].following = dest;
 		}
 		following[dest++] = indata[i].leader;
 	}
 	end2 = dest;
+	endid = id;
 
 	switch (pthread_barrier_wait(&bar)) {
 	case 0:
 	case PTHREAD_BARRIER_SERIAL_THREAD:
-		break;
-	default:
-		errx(1, "pthread_barrier_wait");
-	}
-
-	for (i = start2; i < end2; ++i) {
-		if (following[i] == 0) {
-			following[i] = make_crossptr(0);
-		} else {
-			following[i] = idmap[following[i]];
-		}
-	}
-
-	switch (pthread_barrier_wait(&bar)) {
-	case 0:
-		break;
-	case PTHREAD_BARRIER_SERIAL_THREAD:
-		free(idmap);
 		break;
 	default:
 		errx(1, "pthread_barrier_wait");
@@ -173,11 +142,8 @@ worker(void *arg)
 #else
 	for (i = start2; i < end2; ++i) {
 		id = following[i];
-		if (is_crossptr(id))
-			continue;
 
-		/* hack: first count the number of entries */
-		__sync_add_and_fetch(&following[id], 1);
+		__sync_add_and_fetch(&idmap[id].nfollower, 1);
 	}
 
 	/* propagate counts */
@@ -189,12 +155,8 @@ worker(void *arg)
 		pthread_mutex_unlock(&me->mtx);
 	}
 
-	for (i = start2; i < end2; ++i) {
-		if (!is_crossptr(following[i]))
-			continue;
-
-		nleader += get_crossptr(following[i]);
-	}
+	for (i = startid; i < endid; ++i)
+		nleader += idmap[i].nfollower;
 
 	start3 = me->nleader;
 	end3 = start3 + nleader;
@@ -210,14 +172,9 @@ worker(void *arg)
 #endif
 
 	dest = start3;
-	for (i = start2; i < end2; ++i) {
-		int count;
-
-		if (!is_crossptr(following[i]))
-			continue;
-		count = get_crossptr(following[i]);
-		following[i] = make_crossptr(dest);
-		dest += count + 1;
+	for (i = startid; i < endid; ++i) {
+		idmap[i].follower = dest;
+		dest += idmap[i].nfollower;
 	}
 
 	switch (pthread_barrier_wait(&bar)) {
@@ -243,16 +200,26 @@ worker(void *arg)
 		followed[dest + followed[dest]] = from;
 	}
 #else
-	for (i = start2; i < end2; ++i) {
-		id = following[i];
-		if (is_crossptr(id)) {
-			from = i;
-			continue;
+	int nextfrom = 0;
+
+	for (from = startid; from < endid; from = nextfrom) {
+		int endi = end2;
+
+		for (nextfrom = from + 1; nextfrom < endid; ++nextfrom) {
+			if (idmap[nextfrom].following != 0) {
+				endi = idmap[nextfrom].following;
+				break;
+			}
 		}
 
-		dest = get_crossptr(following[id]);
-		dest += __sync_add_and_fetch(&followed[dest], 1);
-		followed[dest] = from;
+		if (idmap[from].following == 0)
+			continue;
+
+		for (i = idmap[from].following; i < endi; ++i) {
+			id = following[i];
+			dest = __sync_add_and_fetch(&idmap[id].nfollower, -1);
+			followed[idmap[id].follower + dest] = from;
+		}
 	}
 #endif
 
@@ -284,7 +251,7 @@ int main (int argc, char const* argv[])
 
 	following = calloc(sizeof(*following), nentries2);
 	followed = calloc(sizeof(*followed), nentries2);
-	idmap = calloc(sizeof(*idmap), maxfollower + 1);
+	idmap = calloc(sizeof(*idmap), maxfollower + 2);
 
 	if (!following || !followed || !idmap)
 		err(1, "alloc");
