@@ -110,7 +110,12 @@ worker(void *arg)
 		idmap[id].nfollowing++;
 	}
 	end2 = dest;
-	endid = id;
+	endid = id + 1;
+
+	if (mycpu == 0) {
+		idmap[0].following = UINT32_MAX;
+		idmap[0].followed = UINT32_MAX;
+	}
 
 	switch (pthread_barrier_wait(&bar)) {
 	case 0:
